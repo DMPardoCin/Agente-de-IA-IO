@@ -1,0 +1,665 @@
+"""
+=============================================================
+MODELO CPM — DISTRIBUCIÓN DE RECURSOS EN REDES
+Interfaz Gráfica con Tkinter
+Investigación de Operaciones — Grupo 9/10
+=============================================================
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import threading
+import json
+import urllib.request
+import urllib.error
+import textwrap
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import matplotlib.patches as mpatches
+from collections import defaultdict
+
+# ─────────────────────────────────────────────
+# COLORES Y ESTILO
+# ─────────────────────────────────────────────
+BG_DARK    = "#1a1a2e"
+BG_PANEL   = "#16213e"
+BG_CARD    = "#0f3460"
+ACCENT     = "#e94560"
+ACCENT2    = "#1D9E75"
+TEXT_LIGHT = "#eaeaea"
+TEXT_DIM   = "#8892a4"
+FONT_TITLE = ("Segoe UI", 14, "bold")
+FONT_SUB   = ("Segoe UI", 10, "bold")
+FONT_BODY  = ("Segoe UI", 9)
+FONT_MONO  = ("Consolas", 9)
+
+# ─────────────────────────────────────────────
+# DATOS DEL PROYECTO (editables desde la GUI)
+# ─────────────────────────────────────────────
+ACTIVIDADES_DEFAULT = {
+    "A": {"nombre": "Excavación",          "duracion": 3, "recursos": 4,  "predecesoras": []},
+    "B": {"nombre": "Cimentación",         "duracion": 5, "recursos": 6,  "predecesoras": ["A"]},
+    "C": {"nombre": "Estructura metálica", "duracion": 4, "recursos": 8,  "predecesoras": ["B"]},
+    "D": {"nombre": "Inst. eléctrica",     "duracion": 3, "recursos": 3,  "predecesoras": ["B"]},
+    "E": {"nombre": "Inst. hidráulica",    "duracion": 2, "recursos": 3,  "predecesoras": ["B"]},
+    "F": {"nombre": "Techado",             "duracion": 3, "recursos": 5,  "predecesoras": ["C"]},
+    "G": {"nombre": "Acabados",            "duracion": 4, "recursos": 6,  "predecesoras": ["D","E","F"]},
+    "H": {"nombre": "Equipamiento",        "duracion": 2, "recursos": 4,  "predecesoras": ["G"]},
+}
+RECURSOS_DISP_DEFAULT = 12
+
+LLAMAFILE_URL   = "http://localhost:8080/v1/chat/completions"
+LLAMAFILE_MODEL = "mistral-7b-instruct-v0.2.Q2_K"
+
+# ─────────────────────────────────────────────
+# LÓGICA CPM
+# ─────────────────────────────────────────────
+
+def construir_red(actividades):
+    G = nx.DiGraph()
+    for act_id, datos in actividades.items():
+        G.add_node(act_id, **datos)
+    for act_id, datos in actividades.items():
+        for pred in datos["predecesoras"]:
+            G.add_edge(pred, act_id)
+    return G
+
+def calcular_cpm(G, actividades):
+    orden = list(nx.topological_sort(G))
+    ES, EF = {}, {}
+    for act in orden:
+        preds = list(G.predecessors(act))
+        ES[act] = max((EF[p] for p in preds), default=0)
+        EF[act] = ES[act] + actividades[act]["duracion"]
+    T_star = max(EF.values())
+    LF, LS = {}, {}
+    for act in reversed(orden):
+        succs = list(G.successors(act))
+        LF[act] = min((LS[s] for s in succs), default=T_star)
+        LS[act] = LF[act] - actividades[act]["duracion"]
+    TF = {act: LS[act] - ES[act] for act in orden}
+    resultados = []
+    for act in orden:
+        resultados.append({
+            "Actividad":    act,
+            "Nombre":       actividades[act]["nombre"],
+            "Duración":     actividades[act]["duracion"],
+            "Recursos":     actividades[act]["recursos"],
+            "ES":           ES[act],
+            "EF":           EF[act],
+            "LS":           LS[act],
+            "LF":           LF[act],
+            "Holgura (TF)": TF[act],
+            "Crítica":      TF[act] == 0,
+        })
+    return pd.DataFrame(resultados), T_star, ES, EF, LS, LF, TF
+
+def obtener_ruta_critica(G, TF):
+    criticas = [a for a, tf in TF.items() if tf == 0]
+    subg = G.subgraph(criticas)
+    rutas = []
+    inicios = [n for n in subg.nodes if subg.in_degree(n) == 0]
+    fines   = [n for n in subg.nodes if subg.out_degree(n) == 0]
+    for ini in inicios:
+        for fin in fines:
+            for ruta in nx.all_simple_paths(subg, ini, fin):
+                rutas.append(ruta)
+    return criticas, rutas
+
+def calcular_perfil_recursos(actividades, ES, EF, T_star, inicio_override=None):
+    perfil = defaultdict(int)
+    inicio = inicio_override or ES
+    for act_id, datos in actividades.items():
+        s = inicio[act_id]
+        for t in range(s, s + datos["duracion"]):
+            perfil[t] += datos["recursos"]
+    return [perfil.get(t, 0) for t in range(T_star)]
+
+def nivelar_recursos(actividades, ES, EF, LS, LF, TF, T_star):
+    inicio_actual = dict(ES)
+    con_holgura = sorted([(a, TF[a]) for a in actividades if TF[a] > 0], key=lambda x: -x[1])
+    for act_id, holgura in con_holgura:
+        mejor_varianza = np.var(calcular_perfil_recursos(actividades, ES, EF, T_star, inicio_actual))
+        mejor_inicio = inicio_actual[act_id]
+        for delta in range(1, holgura + 1):
+            candidato = dict(inicio_actual)
+            candidato[act_id] = ES[act_id] + delta
+            v = np.var(calcular_perfil_recursos(actividades, ES, EF, T_star, candidato))
+            if v < mejor_varianza:
+                mejor_varianza = v
+                mejor_inicio = ES[act_id] + delta
+        inicio_actual[act_id] = mejor_inicio
+    return inicio_actual
+
+# ─────────────────────────────────────────────
+# IA LOCAL
+# ─────────────────────────────────────────────
+
+def _llamar_ia(prompt, max_tokens=800, temperatura=0.7):
+    payload = {
+        "model":       LLAMAFILE_MODEL,
+        "messages":    [{"role": "user", "content": prompt}],
+        "max_tokens":  max_tokens,
+        "temperature": temperatura,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req  = urllib.request.Request(
+        LLAMAFILE_URL, data=data,
+        headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            resultado = json.loads(resp.read().decode("utf-8"))
+            return resultado["choices"][0]["message"]["content"].strip()
+    except urllib.error.URLError as e:
+        return (f"[⚠ No se pudo conectar con llamafile en {LLAMAFILE_URL}]\n"
+                f"Asegúrate de que el servidor esté corriendo:\n"
+                f".\\mistral-7b-instruct-v0.2.Q2_K.exe --server --host 0.0.0.0 --port 8080\n"
+                f"Error: {e}")
+    except (KeyError, json.JSONDecodeError) as e:
+        return f"[⚠ Error al interpretar la respuesta]: {e}"
+
+def construir_contexto_cpm(df, rutas, T_star, perfil_orig, perfil_niv, inicio_niv, ES, recursos_disp):
+    ruta_str = " → ".join(rutas[0]) if rutas else "N/A"
+    actos = []
+    for _, row in df.iterrows():
+        tipo = "CRÍTICA" if row["Crítica"] else f"holgura={row['Holgura (TF)']}d"
+        actos.append(f"  {row['Actividad']} ({row['Nombre']}): dur={row['Duración']}d, "
+                     f"recursos={row['Recursos']}, ES={row['ES']}, EF={row['EF']} [{tipo}]")
+    perfil_str = [f"  Día {t}: sin nivelar={o}, nivelado={n}" + (" ← SOBRECARGA" if o > recursos_disp else "")
+                  for t, (o, n) in enumerate(zip(perfil_orig, perfil_niv))]
+    return (f"PROYECTO CPM — Duración: {T_star}d — Recursos disp.: {recursos_disp}/día\n"
+            f"Ruta crítica: {ruta_str}\n\nACTIVIDADES:\n" + "\n".join(actos) +
+            "\n\nPERFIL DE RECURSOS:\n" + "\n".join(perfil_str))
+
+# ─────────────────────────────────────────────
+# APLICACIÓN PRINCIPAL
+# ─────────────────────────────────────────────
+
+class CPMApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("CPM — Distribución de Recursos en Redes  |  IO2-82")
+        self.geometry("1280x800")
+        self.configure(bg=BG_DARK)
+        self.resizable(True, True)
+
+        self.actividades  = {k: dict(v) for k, v in ACTIVIDADES_DEFAULT.items()}
+        self.recursos_disp = RECURSOS_DISP_DEFAULT
+
+        # Resultados CPM (se llenan al calcular)
+        self.df = self.T_star = self.ES = self.EF = None
+        self.LS = self.LF = self.TF = self.G = None
+        self.rutas = self.perfil_orig = self.perfil_niv = self.inicio_niv = None
+
+        self._build_ui()
+        self._calcular()   # Calcular al arrancar
+
+    # ── CONSTRUCCIÓN DE LA UI ──────────────────
+    def _build_ui(self):
+        # ── Cabecera ──
+        header = tk.Frame(self, bg=ACCENT, height=52)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+        tk.Label(header, text="⬡  MODELO CPM — Distribución de Recursos en Redes",
+                 bg=ACCENT, fg="white", font=("Segoe UI", 13, "bold"),
+                 padx=18).pack(side="left", pady=10)
+        tk.Label(header, text="Investigación de Operaciones  |  Grupo 9/10",
+                 bg=ACCENT, fg="#ffd0d8", font=FONT_BODY, padx=18).pack(side="right", pady=10)
+
+        # ── Notebook principal ──
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("TNotebook",          background=BG_DARK,  borderwidth=0)
+        style.configure("TNotebook.Tab",      background=BG_PANEL, foreground=TEXT_DIM,
+                        font=FONT_SUB, padding=[14, 6])
+        style.map("TNotebook.Tab",
+                  background=[("selected", BG_CARD)],
+                  foreground=[("selected", TEXT_LIGHT)])
+        style.configure("TFrame",             background=BG_DARK)
+        style.configure("Treeview",           background=BG_CARD,  foreground=TEXT_LIGHT,
+                        fieldbackground=BG_CARD, rowheight=24, font=FONT_MONO)
+        style.configure("Treeview.Heading",   background=BG_PANEL, foreground=ACCENT,
+                        font=FONT_SUB, relief="flat")
+        style.map("Treeview", background=[("selected", ACCENT)])
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.tab_datos   = ttk.Frame(self.nb)
+        self.tab_tabla   = ttk.Frame(self.nb)
+        self.tab_red     = ttk.Frame(self.nb)
+        self.tab_gantt   = ttk.Frame(self.nb)
+        self.tab_perfil  = ttk.Frame(self.nb)
+        self.tab_ia      = ttk.Frame(self.nb)
+
+        self.nb.add(self.tab_datos,  text="  📋 Datos del proyecto  ")
+        self.nb.add(self.tab_tabla,  text="  📊 Tabla CPM  ")
+        self.nb.add(self.tab_red,    text="  🕸 Red CPM  ")
+        self.nb.add(self.tab_gantt,  text="  📅 Gantt  ")
+        self.nb.add(self.tab_perfil, text="  📈 Perfil de Recursos  ")
+        self.nb.add(self.tab_ia,     text="  🤖 Análisis IA  ")
+
+        self._build_tab_datos()
+        self._build_tab_tabla()
+        self._build_tab_graficas()
+        self._build_tab_ia()
+
+    # ── TAB: DATOS ─────────────────────────────
+    def _build_tab_datos(self):
+        f = self.tab_datos
+        f.configure(style="TFrame")
+
+        top = tk.Frame(f, bg=BG_DARK)
+        top.pack(fill="x", padx=14, pady=(12, 4))
+
+        tk.Label(top, text="Actividades del proyecto", bg=BG_DARK,
+                 fg=ACCENT, font=FONT_TITLE).pack(side="left")
+
+        btn_frame = tk.Frame(top, bg=BG_DARK)
+        btn_frame.pack(side="right")
+        self._btn(btn_frame, "▶  Calcular CPM", self._calcular, ACCENT).pack(side="right", padx=4)
+
+        # Tabla editable de actividades
+        cols = ("ID", "Nombre", "Duración", "Recursos", "Predecesoras")
+        self.tree_datos = ttk.Treeview(f, columns=cols, show="headings", height=10)
+        for c in cols:
+            self.tree_datos.heading(c, text=c)
+            self.tree_datos.column(c, width=160, anchor="center")
+        self.tree_datos.pack(fill="both", padx=14, pady=4, expand=False)
+        self._refresh_tree_datos()
+
+        # Recursos disponibles
+        mid = tk.Frame(f, bg=BG_DARK)
+        mid.pack(fill="x", padx=14, pady=6)
+        tk.Label(mid, text="Recursos disponibles por día:", bg=BG_DARK,
+                 fg=TEXT_LIGHT, font=FONT_SUB).pack(side="left", padx=(0, 8))
+        self.var_recursos = tk.IntVar(value=self.recursos_disp)
+        tk.Spinbox(mid, from_=1, to=100, textvariable=self.var_recursos,
+                   width=6, font=FONT_BODY, bg=BG_CARD, fg=TEXT_LIGHT,
+                   buttonbackground=BG_PANEL, relief="flat").pack(side="left")
+
+        # Área de resultados rápidos
+        tk.Label(f, text="Resumen rápido", bg=BG_DARK, fg=ACCENT, font=FONT_SUB
+                 ).pack(anchor="w", padx=14, pady=(10, 2))
+        self.txt_resumen = scrolledtext.ScrolledText(f, height=12, bg=BG_CARD,
+                           fg=TEXT_LIGHT, font=FONT_MONO, relief="flat", bd=0,
+                           insertbackground=TEXT_LIGHT)
+        self.txt_resumen.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+
+    def _refresh_tree_datos(self):
+        self.tree_datos.delete(*self.tree_datos.get_children())
+        for act_id, d in self.actividades.items():
+            preds = ", ".join(d["predecesoras"]) if d["predecesoras"] else "—"
+            self.tree_datos.insert("", "end", values=(
+                act_id, d["nombre"], d["duracion"], d["recursos"], preds))
+
+    # ── TAB: TABLA CPM ─────────────────────────
+    def _build_tab_tabla(self):
+        f = self.tab_tabla
+        cols = ("Actividad","Nombre","Duración","Recursos",
+                "ES","EF","LS","LF","Holgura (TF)","Crítica")
+        self.tree_cpm = ttk.Treeview(f, columns=cols, show="headings")
+        widths = [75,180,75,75,55,55,55,55,90,70]
+        for c, w in zip(cols, widths):
+            self.tree_cpm.heading(c, text=c)
+            self.tree_cpm.column(c, width=w, anchor="center")
+        self.tree_cpm.tag_configure("critica",  background="#3a0f17", foreground=ACCENT)
+        self.tree_cpm.tag_configure("normal",   background=BG_CARD,   foreground=ACCENT2)
+
+        sb = ttk.Scrollbar(f, orient="horizontal", command=self.tree_cpm.xview)
+        self.tree_cpm.configure(xscrollcommand=sb.set)
+        self.tree_cpm.pack(fill="both", expand=True, padx=10, pady=10)
+        sb.pack(fill="x", padx=10)
+
+        # Métricas rápidas
+        self.frame_metricas = tk.Frame(f, bg=BG_DARK)
+        self.frame_metricas.pack(fill="x", padx=10, pady=(0, 10))
+
+    # ── TABS: GRÁFICAS ─────────────────────────
+    def _build_tab_graficas(self):
+        for tab, attr in [
+            (self.tab_red,    "canvas_red"),
+            (self.tab_gantt,  "canvas_gantt"),
+            (self.tab_perfil, "canvas_perfil"),
+        ]:
+            frame = tk.Frame(tab, bg=BG_DARK)
+            frame.pack(fill="both", expand=True)
+            setattr(self, attr + "_frame", frame)
+
+    # ── TAB: IA ────────────────────────────────
+    def _build_tab_ia(self):
+        f = self.tab_ia
+        top = tk.Frame(f, bg=BG_DARK)
+        top.pack(fill="x", padx=14, pady=10)
+        tk.Label(top, text="🤖  Análisis con IA local (llamafile Mistral-7B)",
+                 bg=BG_DARK, fg=ACCENT, font=FONT_TITLE).pack(side="left")
+
+        btn_ia = self._btn(top, "▶  Consultar IA", self._lanzar_ia, "#c0392b")
+        btn_ia.pack(side="right", padx=4)
+
+        self.lbl_ia_estado = tk.Label(top, text="", bg=BG_DARK, fg=ACCENT2, font=FONT_BODY)
+        self.lbl_ia_estado.pack(side="right", padx=10)
+
+        # Selector de pregunta
+        sel_frame = tk.Frame(f, bg=BG_PANEL, pady=6)
+        sel_frame.pack(fill="x", padx=14)
+        tk.Label(sel_frame, text="Tipo de análisis:", bg=BG_PANEL,
+                 fg=TEXT_LIGHT, font=FONT_SUB).pack(side="left", padx=8)
+        self.var_ia_tipo = tk.StringVar(value="analisis_cpm")
+        opciones = [
+            ("Ruta crítica y tiempos",      "analisis_cpm"),
+            ("Evaluación de nivelación",    "evaluacion_nivelacion"),
+            ("Recomendaciones y riesgos",   "recomendaciones"),
+        ]
+        for texto, valor in opciones:
+            tk.Radiobutton(sel_frame, text=texto, variable=self.var_ia_tipo,
+                           value=valor, bg=BG_PANEL, fg=TEXT_LIGHT, selectcolor=BG_CARD,
+                           activebackground=BG_PANEL, font=FONT_BODY).pack(side="left", padx=10)
+
+        self.txt_ia = scrolledtext.ScrolledText(f, bg=BG_CARD, fg=TEXT_LIGHT,
+                      font=FONT_MONO, relief="flat", bd=0, insertbackground=TEXT_LIGHT)
+        self.txt_ia.pack(fill="both", expand=True, padx=14, pady=10)
+        self.txt_ia.insert("end",
+            "Presiona '▶ Consultar IA' para enviar los resultados del CPM\n"
+            "al servidor llamafile local y recibir un análisis detallado.\n\n"
+            "Requisito: tener el servidor corriendo en localhost:8080\n"
+            ".\\mistral-7b-instruct-v0.2.Q2_K.exe --server --host 0.0.0.0 --port 8080")
+        self.txt_ia.configure(state="disabled")
+
+    # ── HELPERS ────────────────────────────────
+    def _btn(self, parent, texto, cmd, color=ACCENT2):
+        b = tk.Button(parent, text=texto, command=cmd,
+                      bg=color, fg="white", font=FONT_SUB,
+                      relief="flat", padx=12, pady=5, cursor="hand2",
+                      activebackground="#c0392b", activeforeground="white")
+        return b
+
+    def _card(self, parent, titulo, valor, color=ACCENT):
+        card = tk.Frame(parent, bg=BG_CARD, padx=14, pady=8)
+        card.pack(side="left", padx=6)
+        tk.Label(card, text=titulo, bg=BG_CARD, fg=TEXT_DIM, font=("Segoe UI", 8)).pack()
+        tk.Label(card, text=valor,  bg=BG_CARD, fg=color,    font=("Segoe UI", 15, "bold")).pack()
+
+    # ── CÁLCULO CPM ────────────────────────────
+    def _calcular(self):
+        self.recursos_disp = self.var_recursos.get()
+        try:
+            self.G = construir_red(self.actividades)
+            self.df, self.T_star, self.ES, self.EF, self.LS, self.LF, self.TF = \
+                calcular_cpm(self.G, self.actividades)
+            _, self.rutas = obtener_ruta_critica(self.G, self.TF)
+            self.perfil_orig = calcular_perfil_recursos(
+                self.actividades, self.ES, self.EF, self.T_star)
+            self.inicio_niv  = nivelar_recursos(
+                self.actividades, self.ES, self.EF, self.LS, self.LF, self.TF, self.T_star)
+            self.perfil_niv  = calcular_perfil_recursos(
+                self.actividades, self.ES, self.EF, self.T_star, self.inicio_niv)
+        except Exception as e:
+            messagebox.showerror("Error en CPM", str(e))
+            return
+
+        self._actualizar_resumen()
+        self._actualizar_tabla()
+        self._graficar_red()
+        self._graficar_gantt()
+        self._graficar_perfil()
+
+    # ── RESUMEN ────────────────────────────────
+    def _actualizar_resumen(self):
+        ruta = " → ".join(self.rutas[0]) if self.rutas else "N/A"
+        var_o = np.var(self.perfil_orig)
+        var_n = np.var(self.perfil_niv)
+        sob_o = sum(1 for v in self.perfil_orig if v > self.recursos_disp)
+        sob_n = sum(1 for v in self.perfil_niv  if v > self.recursos_disp)
+
+        txt = (
+            f"{'─'*55}\n"
+            f" DURACIÓN MÍNIMA DEL PROYECTO : {self.T_star} días\n"
+            f" RUTA CRÍTICA                 : {ruta}\n"
+            f" RECURSOS DISPONIBLES/DÍA     : {self.recursos_disp} trabajadores\n"
+            f"{'─'*55}\n"
+            f" VARIANZA DEL PERFIL    : {var_o:.2f}  →  {var_n:.2f}  ({((var_n-var_o)/var_o*100):+.1f}%)\n"
+            f" PICO DE RECURSOS       : {max(self.perfil_orig)}  →  {max(self.perfil_niv)} trab.\n"
+            f" DÍAS CON SOBRECARGA    : {sob_o}  →  {sob_n}\n"
+            f"{'─'*55}\n"
+            f" ACTIVIDADES CON HOLGURA:\n"
+        )
+        for _, row in self.df[self.df["Holgura (TF)"] > 0].iterrows():
+            txt += (f"   {row['Actividad']}  {row['Nombre']:<22} "
+                    f"holgura = {row['Holgura (TF)']} días\n")
+
+        self.txt_resumen.configure(state="normal")
+        self.txt_resumen.delete("1.0", "end")
+        self.txt_resumen.insert("end", txt)
+        self.txt_resumen.configure(state="disabled")
+
+    # ── TABLA CPM ──────────────────────────────
+    def _actualizar_tabla(self):
+        self.tree_cpm.delete(*self.tree_cpm.get_children())
+        for _, row in self.df.iterrows():
+            tag = "critica" if row["Crítica"] else "normal"
+            self.tree_cpm.insert("", "end", tags=(tag,), values=(
+                row["Actividad"], row["Nombre"], row["Duración"], row["Recursos"],
+                row["ES"], row["EF"], row["LS"], row["LF"],
+                row["Holgura (TF)"], "✓ SÍ" if row["Crítica"] else "No",
+            ))
+
+        # Métricas
+        for w in self.frame_metricas.winfo_children():
+            w.destroy()
+        self._card(self.frame_metricas, "Duración", f"{self.T_star} d")
+        self._card(self.frame_metricas, "Ruta crítica",
+                   " → ".join(self.rutas[0]) if self.rutas else "N/A", ACCENT)
+        self._card(self.frame_metricas, "Pico recursos",
+                   f"{max(self.perfil_orig)} → {max(self.perfil_niv)} trab.", ACCENT2)
+        self._card(self.frame_metricas, "Días sobrecarga",
+                   f"{sum(1 for v in self.perfil_orig if v>self.recursos_disp)}"
+                   f" → {sum(1 for v in self.perfil_niv if v>self.recursos_disp)}", "#EF9F27")
+
+    # ── GRÁFICA: RED ───────────────────────────
+    def _graficar_red(self):
+        frame = self.canvas_red_frame
+        for w in frame.winfo_children():
+            w.destroy()
+
+        fig, ax = plt.subplots(figsize=(11, 4.5))
+        fig.patch.set_facecolor(BG_DARK)
+        ax.set_facecolor(BG_PANEL)
+
+        pos = {
+            "A":(0,0),"B":(2,0),"C":(4,1),"D":(4,0),
+            "E":(4,-1),"F":(6,1),"G":(8,0),"H":(10,0),
+        }
+        criticos = [n for n in self.G.nodes if self.TF[n] == 0]
+        normales = [n for n in self.G.nodes if self.TF[n] > 0]
+        arcos_cr = [(u,v) for u,v in self.G.edges if self.TF[u]==0 and self.TF[v]==0]
+        arcos_no = [(u,v) for u,v in self.G.edges if (u,v) not in arcos_cr]
+
+        nx.draw_networkx_nodes(self.G, pos, nodelist=criticos, node_color=ACCENT,
+                               node_size=1600, ax=ax, alpha=0.9)
+        nx.draw_networkx_nodes(self.G, pos, nodelist=normales, node_color=ACCENT2,
+                               node_size=1600, ax=ax, alpha=0.9)
+        nx.draw_networkx_edges(self.G, pos, edgelist=arcos_cr, edge_color=ACCENT,
+                               width=2.5, arrows=True, arrowsize=20, ax=ax,
+                               connectionstyle="arc3,rad=0.05")
+        nx.draw_networkx_edges(self.G, pos, edgelist=arcos_no, edge_color="#888780",
+                               width=1.2, arrows=True, arrowsize=18, ax=ax,
+                               connectionstyle="arc3,rad=0.05")
+        etiquetas = {n: f"{n}\nES={self.ES[n]} EF={self.EF[n]}" for n in self.G.nodes}
+        nx.draw_networkx_labels(self.G, pos, labels=etiquetas, font_size=8,
+                                font_color="white", font_weight="bold", ax=ax)
+        ax.set_title("Red CPM — Ruta crítica en rojo", color=TEXT_LIGHT, fontsize=11, pad=10)
+        ax.axis("off")
+        plt.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, frame).pack(fill="x")
+        plt.close(fig)
+
+    # ── GRÁFICA: GANTT ─────────────────────────
+    def _graficar_gantt(self):
+        frame = self.canvas_gantt_frame
+        for w in frame.winfo_children():
+            w.destroy()
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        fig.patch.set_facecolor(BG_DARK)
+        ax.set_facecolor(BG_PANEL)
+
+        yticks, ylabels = [], []
+        for i, row in self.df.iterrows():
+            y = len(self.df) - i - 1
+            yticks.append(y); ylabels.append(f"{row['Actividad']}  {row['Nombre']}")
+            color = ACCENT if row["Crítica"] else "#378ADD"
+            ax.barh(y, row["Duración"], left=row["ES"], color=color,
+                    alpha=0.85, height=0.55, edgecolor="white", linewidth=0.5)
+            if row["Holgura (TF)"] > 0:
+                ax.barh(y, row["Holgura (TF)"], left=row["EF"],
+                        color=color, alpha=0.2, height=0.55,
+                        edgecolor=color, linewidth=0.8, linestyle="--")
+            act = row["Actividad"]
+            if self.inicio_niv.get(act, self.ES[act]) != self.ES[act]:
+                ax.plot(self.inicio_niv[act] + row["Duración"]/2, y,
+                        "v", color="#EF9F27", markersize=7, zorder=5)
+            ax.text(row["ES"] + row["Duración"]/2, y, f"{row['Duración']}d",
+                    ha="center", va="center", fontsize=8,
+                    color="white", fontweight="bold")
+
+        ax.set_yticks(yticks); ax.set_yticklabels(ylabels, fontsize=9, color=TEXT_LIGHT)
+        ax.set_xlabel("Días", fontsize=9, color=TEXT_LIGHT)
+        ax.set_xlim(0, self.T_star + 1)
+        ax.set_xticks(range(self.T_star + 1))
+        ax.tick_params(colors=TEXT_LIGHT)
+        ax.grid(axis="x", alpha=0.25, linestyle="--", color="#555")
+        ax.set_title("Diagrama de Gantt  (▼ = inicio nivelado)", color=TEXT_LIGHT, fontsize=11)
+        fig.patch.set_facecolor(BG_DARK)
+        plt.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, frame).pack(fill="x")
+        plt.close(fig)
+
+    # ── GRÁFICA: PERFIL ────────────────────────
+    def _graficar_perfil(self):
+        frame = self.canvas_perfil_frame
+        for w in frame.winfo_children():
+            w.destroy()
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+        fig.patch.set_facecolor(BG_DARK)
+        dias = list(range(self.T_star))
+
+        for ax, perfil, titulo, color in [
+            (axes[0], self.perfil_orig, "Sin nivelación", ACCENT),
+            (axes[1], self.perfil_niv,  "Con nivelación", ACCENT2),
+        ]:
+            ax.set_facecolor(BG_PANEL)
+            bars = ax.bar(dias, perfil, color=color, alpha=0.75,
+                          edgecolor="white", linewidth=0.4)
+            for bar, val in zip(bars, perfil):
+                if val > self.recursos_disp:
+                    bar.set_color("#ff2244"); bar.set_alpha(0.95)
+            ax.axhline(self.recursos_disp, color=TEXT_LIGHT, linestyle="--",
+                       linewidth=1.2, label=f"Límite: {self.recursos_disp}")
+            ax.axhline(np.mean(perfil), color="#EF9F27", linestyle=":",
+                       linewidth=1.2, label=f"Promedio: {np.mean(perfil):.1f}")
+            ax.set_title(titulo, fontsize=11, color=TEXT_LIGHT)
+            ax.set_xlabel("Día", fontsize=9, color=TEXT_DIM)
+            ax.set_ylabel("Trabajadores", fontsize=9, color=TEXT_DIM)
+            ax.tick_params(colors=TEXT_LIGHT)
+            ax.legend(fontsize=8, facecolor=BG_CARD, labelcolor=TEXT_LIGHT)
+            ax.grid(axis="y", alpha=0.2, color="#555")
+            varianza = np.var(perfil)
+            pico     = max(perfil)
+            sobrecar = sum(1 for v in perfil if v > self.recursos_disp)
+            ax.text(0.02, 0.97,
+                    f"Var: {varianza:.1f}  |  Pico: {pico}  |  Sobrecarga: {sobrecar}d",
+                    transform=ax.transAxes, fontsize=7.5, va="top", color=TEXT_LIGHT,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor=BG_CARD, alpha=0.8))
+
+        fig.suptitle("Perfil de Recursos — Antes vs Después de la Nivelación",
+                     fontsize=11, color=TEXT_LIGHT)
+        plt.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, frame).pack(fill="x")
+        plt.close(fig)
+
+    # ── CONSULTA IA ────────────────────────────
+    def _lanzar_ia(self):
+        if self.df is None:
+            messagebox.showwarning("Aviso", "Primero ejecuta el CPM.")
+            return
+        self.lbl_ia_estado.configure(text="⏳ Consultando IA...")
+        self.txt_ia.configure(state="normal")
+        self.txt_ia.delete("1.0", "end")
+        self.txt_ia.insert("end", "Enviando datos al servidor llamafile...\n")
+        self.txt_ia.configure(state="disabled")
+        threading.Thread(target=self._ia_worker, daemon=True).start()
+
+    def _ia_worker(self):
+        tipo = self.var_ia_tipo.get()
+        ctx  = construir_contexto_cpm(
+            self.df, self.rutas, self.T_star,
+            self.perfil_orig, self.perfil_niv,
+            self.inicio_niv, self.ES, self.recursos_disp
+        )
+        prompts = {
+            "analisis_cpm": (
+                "ANÁLISIS DE RUTA CRÍTICA Y TIEMPOS",
+                ctx + "\n\nEres experto en IO. Responde en español:\n"
+                "1. ¿Cuáles son las actividades más vulnerables y por qué?\n"
+                "2. ¿Qué implica la holgura de cada actividad no crítica?\n"
+                "3. ¿Existe riesgo de retraso dado el perfil de recursos?"
+            ),
+            "evaluacion_nivelacion": (
+                "EVALUACIÓN DE LA NIVELACIÓN DE RECURSOS",
+                ctx + "\n\nEres especialista en planificación. Responde en español:\n"
+                "1. ¿Fue efectiva la nivelación? Sustenta con métricas.\n"
+                "2. ¿Siguen existiendo días problemáticos tras la nivelación?\n"
+                "3. ¿Las actividades desplazadas son buenas candidatas?"
+            ),
+            "recomendaciones": (
+                "RECOMENDACIONES Y GESTIÓN DE RIESGOS",
+                ctx + "\n\nEres consultor senior. Responde en español:\n"
+                "1. ¿Qué tres acciones concretas mejorarían la ejecución?\n"
+                "2. ¿Cómo mitigarías los riesgos de la ruta crítica?\n"
+                "3. Si el cliente exige reducir el proyecto en 2 días, ¿qué estrategia aplicarías?"
+            ),
+        }
+        titulo, prompt = prompts[tipo]
+        respuesta = _llamar_ia(prompt)
+
+        self.after(0, self._ia_mostrar, titulo, respuesta)
+
+    def _ia_mostrar(self, titulo, respuesta):
+        self.txt_ia.configure(state="normal")
+        self.txt_ia.delete("1.0", "end")
+        sep = "═" * 60
+        self.txt_ia.insert("end", f"{sep}\n  {titulo}\n{sep}\n\n")
+        for linea in respuesta.splitlines():
+            wrapped = textwrap.fill(linea, width=80, subsequent_indent="   ")
+            self.txt_ia.insert("end", (wrapped if wrapped else "") + "\n")
+        self.txt_ia.configure(state="disabled")
+        self.lbl_ia_estado.configure(text="✓ Análisis recibido")
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    app = CPMApp()
+    app.mainloop()
