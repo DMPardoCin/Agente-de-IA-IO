@@ -20,9 +20,9 @@ O descárgalo como archivo `.zip` y descomprímelo.
 El modelo de IA se incluye en el repositorio con el nobmre de mistral-7b-instruct-v0.2.Q2_K.exe
 Para correrlo en local se debe entrar a una consola y abrir la carpeta en la que se encuentra dicho archivo
 y ejecutar el siugiente comando:
+```bash
 .\mistral-7b-instruct-v0.2.Q2_K.exe --server --host 0.0.0.0 --port 8080
-
-
+```
 
 ### Activar el entorno virtual
 
