@@ -17,7 +17,11 @@ O descárgalo como archivo `.zip` y descomprímelo.
 
 ##  Configuración del modelo de IA
 
-El modelo de IA se incluye en el repositorio con el nobmre de mistral-7b-instruct-v0.2.Q2_K.exe
+El modelo de IA se puede descargar desde el siguiente enlace:
+
+```bash
+https://huggingface.co/mozilla-ai/Mistral-7B-Instruct-v0.2-llamafile/blob/main/mistral-7b-instruct-v0.2.Q2_K.llamafile
+```
 Para correrlo en local se debe entrar a una consola y abrir la carpeta en la que se encuentra dicho archivo
 y ejecutar el siugiente comando:
 ```bash
