@@ -22,8 +22,9 @@ El modelo de IA se puede descargar desde el siguiente enlace:
 ```bash
 https://huggingface.co/mozilla-ai/Mistral-7B-Instruct-v0.2-llamafile/blob/main/mistral-7b-instruct-v0.2.Q2_K.llamafile
 ```
+Una vez descargado hay que cambiar la extension del archivo de .llamafile a .exe
 Para correrlo en local se debe entrar a una consola y abrir la carpeta en la que se encuentra dicho archivo
-y ejecutar el siugiente comando:
+y ejecutar el siguiente comando:
 ```bash
 .\mistral-7b-instruct-v0.2.Q2_K.exe --server --host 0.0.0.0 --port 8080
 ```
